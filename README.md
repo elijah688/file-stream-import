@@ -1,0 +1,1 @@
+This project is a Go-based CSV file uploader that streams data from a CSV file and imports it into a PostgreSQL database. It includes pagination for viewing stored locations and uses a reader-writer pattern for efficient handling of large datasets.
