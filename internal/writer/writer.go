@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"encoding/csv"
 	"fmt"
+	"import/internal/buffer"
 	"import/internal/db"
 	"import/internal/model"
 	"io"
@@ -11,6 +12,8 @@ import (
 
 	"github.com/rs/cors"
 )
+
+const chunkSize = 1000
 
 type Writer struct {
 	db  *db.DB
@@ -37,13 +40,18 @@ func (w *Writer) UploadHandler(wr http.ResponseWriter, r *http.Request) {
 
 	fmt.Println("Receiving file stream...")
 	reader := bufio.NewReader(r.Body)
-
 	csvReader := csv.NewReader(reader)
 
-	i := 0
-
 	ms := make(map[string]int, 0)
-	for {
+	buff := buffer.NewBuffer[model.Location]()
+	store := func(ls []model.Location) {
+		if err := w.db.ProcessCSVChunks(r.Context(), ls); err != nil {
+			http.Error(wr, fmt.Sprintf("failed to process CSV chunk: %v", err), http.StatusInternalServerError)
+			return
+		}
+	}
+
+	for i := 0; ; i++ {
 		record, err := csvReader.Read()
 		if err != nil {
 			if err == io.EOF {
@@ -53,25 +61,23 @@ func (w *Writer) UploadHandler(wr http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if i == 0 {
-			for i, c := range record {
-				ms[c] = i
+			for j, c := range record {
+				ms[c] = j
 			}
+			continue
 		}
-		location := model.Location{
+		buff.Append(model.Location{
 			LocID:       record[ms["LOCID"]],
 			LocTimeZone: record[ms["LOCTIMEZONE"]],
 			Country:     record[ms["COUNTRY"]],
 			LocName:     record[ms["LOCNAME"]],
 			Business:    record[ms["BUSINESS"]],
-		}
+		})
 
-		// Process the data into the DB
-		if err := w.db.ProcessCSVChunks(r.Context(), location); err != nil {
-			http.Error(wr, fmt.Sprintf("failed to process CSV chunk: %v", err), http.StatusInternalServerError)
-			return
+		if buff.Size() == chunkSize {
+			store(buff.Load())
+			buff.Flush()
 		}
-
-		i++
 
 	}
 

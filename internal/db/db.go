@@ -40,30 +40,40 @@ func (db *DB) Close() {
 	}
 }
 
-func (d *DB) ProcessCSVChunks(ctx context.Context, l model.Location) error {
+func (d *DB) ProcessCSVChunks(ctx context.Context, locations []model.Location) error {
+	if len(locations) == 0 {
+		return nil // nothing to do
+	}
+
 	columns := []string{"locid", "loctimezone", "country", "locname", "business"}
-	values := []interface{}{l.LocID, l.LocTimeZone, l.Country, l.LocName, l.Business}
+	numColumns := len(columns)
+	valueStrings := make([]string, 0, len(locations))
+	valueArgs := make([]any, 0, len(locations)*numColumns)
 
-	placeholders := []string{"$1", "$2", "$3", "$4", "$5"}
+	for i, loc := range locations {
+		valuePlaceholder := make([]string, numColumns)
+		for j := range columns {
+			valuePlaceholder[j] = fmt.Sprintf("$%d", i*numColumns+j+1)
+		}
+		valueStrings = append(valueStrings, fmt.Sprintf("(%s)", strings.Join(valuePlaceholder, ", ")))
 
-	// SQL query with ON CONFLICT to update all fields except the ID
-	query := fmt.Sprintf(
-		`INSERT INTO locations (%s) 
-		VALUES (%s) 
-		ON CONFLICT (locid) 
-		DO UPDATE 
-			SET loctimezone = EXCLUDED.loctimezone,
-				country = EXCLUDED.country,
-				locname = EXCLUDED.locname,
-				business = EXCLUDED.business`,
-		strings.Join(columns, ", "),
-		strings.Join(placeholders, ", "),
-	)
+		valueArgs = append(valueArgs, loc.LocID, loc.LocTimeZone, loc.Country, loc.LocName, loc.Business)
+	}
 
-	// Execute the query
-	_, err := d.pool.Exec(ctx, query, values...)
+	query := fmt.Sprintf(`
+		INSERT INTO locations (%s)
+		VALUES %s
+		ON CONFLICT (locid)
+		DO UPDATE SET 
+			loctimezone = EXCLUDED.loctimezone,
+			country = EXCLUDED.country,
+			locname = EXCLUDED.locname,
+			business = EXCLUDED.business;
+	`, strings.Join(columns, ", "), strings.Join(valueStrings, ", "))
+
+	_, err := d.pool.Exec(ctx, query, valueArgs...)
 	if err != nil {
-		return fmt.Errorf("failed to insert or update data into database: %w", err)
+		return fmt.Errorf("failed to batch insert/update locations: %w", err)
 	}
 
 	return nil
