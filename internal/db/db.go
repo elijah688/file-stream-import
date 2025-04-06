@@ -42,7 +42,7 @@ func (db *DB) Close() {
 
 func (d *DB) ProcessCSVChunks(ctx context.Context, locations []model.Location) error {
 	if len(locations) == 0 {
-		return nil // nothing to do
+		return nil
 	}
 
 	columns := []string{"locid", "loctimezone", "country", "locname", "business"}

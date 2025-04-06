@@ -1,4 +1,4 @@
-.PHONY: run
+.PHONY: run read write run-reader run-writer gen_file 
 
 read:
 	go run cmd/reader/main.go
@@ -13,3 +13,6 @@ run-reader:
 
 run-writer:
 	bash -c "$(AIR_CMD) -c .air.writer.toml;"
+
+gen_file:
+	go run cmd/gen_file/main.go
