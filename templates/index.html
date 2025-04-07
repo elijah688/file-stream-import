@@ -35,7 +35,15 @@
         Upload
       </button>
     </form>
-
+    <div id="progress-container" class="hidden mt-4 bg-gray-200 rounded-full">
+      <div
+        id="progress-bar"
+        class="bg-blue-500 text-xs font-medium text-blue-100 text-center p-1 leading-none rounded-full transition-all duration-300"
+        style="width: 0%"
+      >
+        0%
+      </div>
+    </div>
     <!-- Locations Table -->
     <div class="mt-12">
       <h3 class="text-2xl font-semibold text-gray-800 mb-6">Locations</h3>
@@ -153,12 +161,20 @@
       if (!file) return;
 
       const socket = new WebSocket("ws://localhost:9090/process");
+      // Show progress bar
+      const progressContainer = document.getElementById("progress-container");
+      const progressBar = document.getElementById("progress-bar");
+      progressContainer.classList.remove("hidden");
+      progressBar.style.width = "0%";
+      progressBar.textContent = "0%";
 
       socket.addEventListener("open", () => {
         console.log("WebSocket connection established!");
 
         const chunkSize = 1024 * 1024;
+        const totalBatches = Math.ceil(file.size / chunkSize);
         let offset = 0;
+        let acknowledgedBatches = 0;
 
         const sendChunk = () => {
           if (offset < file.size) {
@@ -183,7 +199,22 @@
 
         socket.addEventListener("message", (event) => {
           if (event.data === "Chunk received") {
-            sendChunk();
+            acknowledgedBatches++;
+
+            // Update progress bar
+            const progress = (acknowledgedBatches / totalBatches) * 100;
+            progressBar.style.width = `${progress}%`;
+            progressBar.textContent = `${Math.round(progress)}%`;
+
+            if (acknowledgedBatches === totalBatches) {
+              // All chunks acknowledged, close connection after short delay
+              setTimeout(() => {
+                socket.close();
+                progressContainer.classList.add("hidden");
+              }, 1000);
+            } else {
+              sendChunk();
+            }
           }
         });
       });
@@ -203,7 +234,7 @@
       handlePagination();
       document
         .getElementById("upload-form")
-        .addEventListener("submit", handleFormSubmit); 
+        .addEventListener("submit", handleFormSubmit);
     };
   </script>
 </body>
