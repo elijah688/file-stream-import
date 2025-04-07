@@ -1,8 +1,7 @@
 package writer
 
 import (
-	"bufio"
-	"encoding/csv"
+	"context"
 	"fmt"
 	"import/internal/db"
 	"import/internal/model"
@@ -18,7 +17,7 @@ import (
 )
 
 const (
-	chunkSize   = 12000
+	chunkSize   = 13050
 	workerCount = 10
 )
 
@@ -64,131 +63,27 @@ func (w *Writer) StartServer(addr string) error {
 }
 
 func (w *Writer) UploadHandler(wr http.ResponseWriter, r *http.Request) {
-
 	conn, err := w.upgrader.Upgrade(wr, r, nil)
 	if err != nil {
 		http.Error(wr, "Failed to upgrade to WebSocket", http.StatusInternalServerError)
 		return
 	}
 	defer conn.Close()
-
 	log.Println("WebSocket connection established.")
 
-	for {
-		_, msg, err := conn.ReadMessage()
-		if err != nil {
-			log.Println("Error reading message:", err)
-			break
-		}
-		ms := map[string]int{
-			"LOCID":       0,
-			"LOCTIMEZONE": 1,
-			"COUNTRY":     2,
-			"LOCNAME":     3,
-			"BUSINESS":    4,
-		}
-		log.Printf("Received chunk: %s", string(msg))
-
-		rows := strings.Split(string(msg), "\n")
-
-		for _, row := range rows {
-			record := strings.Split(row, ",")
-
-			if len(record) < 5 {
-				log.Printf("Skipping invalid row: %s", row)
-				continue
-			}
-
-			location := model.Location{
-				LocID:       record[ms["LOCID"]],
-				LocTimeZone: record[ms["LOCTIMEZONE"]],
-				Country:     record[ms["COUNTRY"]],
-				LocName:     record[ms["LOCNAME"]],
-				Business:    record[ms["BUSINESS"]],
-			}
-
-			log.Printf("Parsed Location: %+v", location)
-
-		}
-
-		if err = conn.WriteMessage(websocket.TextMessage, []byte("Chunk received")); err != nil {
-			log.Println("Error sending acknowledgment:", err)
-			break
-		}
-	}
-
-	log.Println("WebSocket connection closed.")
-}
-func (w *Writer) uploadHandler(wr http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(wr, "Invalid request method", http.StatusMethodNotAllowed)
-		return
-	}
-
-	fmt.Println("Receiving file stream...")
-	reader := bufio.NewReader(r.Body)
-	csvReader := csv.NewReader(reader)
-
-	wg, errChan, rows := new(sync.WaitGroup), make(chan error), make(chan []model.Location, workerCount*chunkSize)
-
+	rows := make(chan []model.Location, workerCount*chunkSize)
+	errChan := make(chan error, workerCount)
+	var wg sync.WaitGroup
 	count := new(atomic.Uint32)
+
 	for range workerCount {
 		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for ls := range rows {
-
-				if err := w.db.ProcessCSVChunks(r.Context(), ls); err != nil {
-					errChan <- err
-					return
-				}
-				count.Add(uint32(len(ls)))
-				log.Println(count.Load())
-			}
-		}()
-
+		go w.worker(r.Context(), &wg, rows, errChan, count)
 	}
 
 	go func() {
-
 		defer close(rows)
-
-		ms := make(map[string]int, 0)
-
-		buf := make([]model.Location, 0)
-		for i := 0; ; i++ {
-			record, err := csvReader.Read()
-			if err != nil {
-				if err == io.EOF {
-					break
-				}
-				errChan <- fmt.Errorf("error reading CSV file")
-				return
-			}
-			if i == 0 {
-				for j, c := range record {
-					ms[c] = j
-				}
-				continue
-			}
-
-			buf = append(buf, model.Location{
-				LocID:       record[ms["LOCID"]],
-				LocTimeZone: record[ms["LOCTIMEZONE"]],
-				Country:     record[ms["COUNTRY"]],
-				LocName:     record[ms["LOCNAME"]],
-				Business:    record[ms["BUSINESS"]],
-			})
-
-			if len(buf) == chunkSize {
-				rows <- buf
-				buf = make([]model.Location, 0)
-			}
-
-		}
-		if len(buf) > 0 {
-			rows <- buf
-		}
+		w.produceBatches(conn, rows)
 	}()
 
 	go func() {
@@ -196,16 +91,191 @@ func (w *Writer) uploadHandler(wr http.ResponseWriter, r *http.Request) {
 		close(errChan)
 	}()
 
-	for err := range errChan {
-		if err != nil {
-			log.Println(err)
-			http.Error(wr, "failed importing", http.StatusInternalServerError)
+	if err := w.monitorErrors(conn, errChan); err != nil {
+		log.Printf("Processing failed: %v", err)
+		return
+	}
+
+	log.Println("All data processed successfully.")
+	conn.WriteMessage(websocket.TextMessage, []byte("Processing complete"))
+}
+
+func (w *Writer) worker(
+	ctx context.Context,
+	wg *sync.WaitGroup,
+	rows <-chan []model.Location,
+	errChan chan<- error, count *atomic.Uint32,
+) {
+	defer wg.Done()
+	for batch := range rows {
+		if err := w.db.ProcessCSVChunks(ctx, batch); err != nil {
+			errChan <- err
 			return
+		}
+		count.Add(uint32(len(batch)))
+		log.Printf("Processed: %d rows", count.Load())
+	}
+}
+
+func (w *Writer) produceBatches(conn *websocket.Conn, rows chan<- []model.Location) {
+	var (
+		ms         map[string]int
+		gotHeader  bool
+		buf        []model.Location
+		lineBuffer string
+	)
+
+	defer func() {
+		if len(buf) > 0 {
+			rows <- buf
+		}
+	}()
+
+	for {
+		_, msg, err := conn.ReadMessage()
+		if err != nil {
+			handleWebSocketClose(err)
+			break
+		}
+
+		data := lineBuffer + string(msg)
+		lines := strings.Split(data, "\n")
+
+		if strings.HasSuffix(data, "\n") {
+			lineBuffer = ""
+		} else {
+			lineBuffer = lines[len(lines)-1]
+			lines = lines[:len(lines)-1]
+		}
+
+		if err := w.processChunk(lines, &ms, &gotHeader, &buf, rows); err != nil {
+			log.Printf("Processing error: %v", err)
+			break
+		}
+
+		if err := sendAck(conn); err != nil {
+			break
 		}
 	}
 
-	fmt.Println("CSV processed successfully!")
-	wr.WriteHeader(http.StatusOK)
-	wr.Write([]byte("CSV processed successfully"))
-	fmt.Fprintf(wr, "CSV uploaded and processed successfully")
+	if lineBuffer != "" {
+		w.processRemainingLine(lineBuffer, &ms, &gotHeader, &buf, rows)
+	}
+}
+
+func (w *Writer) processChunk(
+	lines []string,
+	ms *map[string]int,
+	gotHeader *bool,
+	buf *[]model.Location,
+	rows chan<- []model.Location,
+) error {
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		if err := w.processLine(line, ms, gotHeader, buf, rows); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (w *Writer) processLine(
+	line string,
+	ms *map[string]int,
+	gotHeader *bool,
+	buf *[]model.Location,
+	rows chan<- []model.Location,
+) error {
+	record := strings.Split(line, ",")
+
+	if needsHeader := !*gotHeader; needsHeader {
+		if len(record) < 5 {
+			return fmt.Errorf("invalid header line: %s", line)
+		}
+		*ms = make(map[string]int)
+		for i, col := range record {
+			(*ms)[strings.TrimSpace(col)] = i
+		}
+		*gotHeader = true
+		return nil
+	}
+
+	if len(record) < len(*ms) {
+		log.Printf("Skipping invalid row: %s", line)
+		return nil
+	}
+
+	*buf = append(*buf, model.Location{
+		LocID:       getField(record, *ms, "LOCID"),
+		LocTimeZone: getField(record, *ms, "LOCTIMEZONE"),
+		Country:     getField(record, *ms, "COUNTRY"),
+		LocName:     getField(record, *ms, "LOCNAME"),
+		Business:    getField(record, *ms, "BUSINESS"),
+	})
+
+	if len(*buf) >= chunkSize {
+		rows <- *buf
+		*buf = make([]model.Location, 0, chunkSize)
+	}
+	return nil
+}
+
+func (w *Writer) processRemainingLine(
+	line string,
+	ms *map[string]int,
+	gotHeader *bool,
+	buf *[]model.Location,
+	rows chan<- []model.Location,
+) {
+	line = strings.TrimSpace(line)
+	if line == "" {
+		return
+	}
+
+	record := strings.Split(line, ",")
+	if len(record) >= len(*ms) {
+		w.processLine(line, ms, gotHeader, buf, rows)
+	} else {
+		log.Printf("Skipping incomplete final line: %s", line)
+	}
+}
+
+func getField(record []string, ms map[string]int, field string) string {
+	if idx, exists := ms[field]; exists && idx < len(record) {
+		return strings.TrimSpace(record[idx])
+	}
+	return ""
+}
+
+func handleWebSocketClose(err error) {
+	if websocket.IsCloseError(err, websocket.CloseGoingAway, websocket.CloseNormalClosure) || err == io.EOF {
+		log.Println("WebSocket closed normally")
+	} else {
+		log.Printf("WebSocket error: %v", err)
+	}
+}
+
+func sendAck(conn *websocket.Conn) error {
+	if err := conn.WriteMessage(websocket.TextMessage, []byte("Chunk received")); err != nil {
+		log.Println("Failed to send ack:", err)
+		return err
+	}
+	return nil
+}
+
+func (w *Writer) monitorErrors(conn *websocket.Conn, errChan <-chan error) error {
+	for err := range errChan {
+		if err != nil {
+			log.Printf("Processing error: %v", err)
+			if werr := conn.WriteMessage(websocket.TextMessage, []byte("Processing error")); werr != nil {
+				return fmt.Errorf("error sending status: %v (original error: %w)", werr, err)
+			}
+			return err
+		}
+
+	}
+	return nil
 }
