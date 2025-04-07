@@ -3,7 +3,6 @@ package writer
 import (
 	"context"
 	"fmt"
-	"import/internal/db"
 	"import/internal/model"
 	"io"
 	"log"
@@ -13,7 +12,6 @@ import (
 	"sync/atomic"
 
 	"github.com/gorilla/websocket"
-	"github.com/rs/cors"
 )
 
 const (
@@ -21,54 +19,16 @@ const (
 	workerCount = 10
 )
 
-type Writer struct {
-	db       *db.DB
-	mux      *http.ServeMux
-	upgrader *websocket.Upgrader
-}
-
-func NewWriter(db *db.DB) *Writer {
-	upgrader := websocket.Upgrader{
-		CheckOrigin: func(r *http.Request) bool {
-			return true
-		},
-	}
-	return &Writer{
-		db:       db,
-		mux:      new(http.ServeMux),
-		upgrader: &upgrader,
-	}
-}
-
-func (w *Writer) RegisterHandlers() {
-	w.mux.HandleFunc("/process", w.UploadHandler)
-	w.mux.HandleFunc("/locations", w.GetLocations)
-}
-
-func (w *Writer) StartServer(addr string) error {
-	w.RegisterHandlers()
-
-	corsHandler := cors.New(cors.Options{
-		AllowedOrigins: []string{"*"},
-		AllowedMethods: []string{"GET", "POST", "OPTIONS"},
-		AllowedHeaders: []string{"Content-Type", "Authorization"},
-	}).Handler(w.mux)
-	fmt.Println("Starting server on", addr)
-
-	if err := http.ListenAndServe(addr, corsHandler); err != nil {
-		return fmt.Errorf("error starting server: %v", err)
-	}
-
-	return nil
-}
-
 func (w *Writer) UploadHandler(wr http.ResponseWriter, r *http.Request) {
+
+	messageChan := make(chan any, workerCount)
 	conn, err := w.upgrader.Upgrade(wr, r, nil)
 	if err != nil {
 		http.Error(wr, "Failed to upgrade to WebSocket", http.StatusInternalServerError)
 		return
 	}
 	defer conn.Close()
+
 	log.Println("WebSocket connection established.")
 
 	rows := make(chan []model.Location, workerCount*chunkSize)
@@ -76,9 +36,17 @@ func (w *Writer) UploadHandler(wr http.ResponseWriter, r *http.Request) {
 	var wg sync.WaitGroup
 	count := new(atomic.Uint32)
 
+	go func() {
+		for range messageChan {
+			if err := conn.WriteMessage(websocket.TextMessage, []byte("processed")); err != nil {
+				log.Println("Failed to send processed:", err)
+			}
+		}
+	}()
+
 	for range workerCount {
 		wg.Add(1)
-		go w.worker(r.Context(), &wg, rows, errChan, count)
+		go w.worker(r.Context(), &wg, rows, errChan, count, messageChan)
 	}
 
 	go func() {
@@ -88,16 +56,22 @@ func (w *Writer) UploadHandler(wr http.ResponseWriter, r *http.Request) {
 
 	go func() {
 		wg.Wait()
+		close(messageChan)
 		close(errChan)
-	}()
 
-	if err := w.monitorErrors(conn, errChan); err != nil {
-		log.Printf("Processing failed: %v", err)
-		return
+	}()
+	for err := range errChan {
+		if err != nil {
+			log.Printf("Processing error: %v", err)
+			conn.WriteMessage(websocket.TextMessage, []byte("Processing error"))
+			return
+		}
+
 	}
 
 	log.Println("All data processed successfully.")
 	conn.WriteMessage(websocket.TextMessage, []byte("Processing complete"))
+
 }
 
 func (w *Writer) worker(
@@ -105,6 +79,7 @@ func (w *Writer) worker(
 	wg *sync.WaitGroup,
 	rows <-chan []model.Location,
 	errChan chan<- error, count *atomic.Uint32,
+	messageChan chan any,
 ) {
 	defer wg.Done()
 	for batch := range rows {
@@ -114,6 +89,7 @@ func (w *Writer) worker(
 		}
 		count.Add(uint32(len(batch)))
 		log.Printf("Processed: %d rows", count.Load())
+		messageChan <- true
 	}
 }
 
@@ -152,10 +128,10 @@ func (w *Writer) produceBatches(conn *websocket.Conn, rows chan<- []model.Locati
 			log.Printf("Processing error: %v", err)
 			break
 		}
-
 		if err := sendAck(conn); err != nil {
 			break
 		}
+
 	}
 
 	if lineBuffer != "" {
@@ -267,15 +243,6 @@ func sendAck(conn *websocket.Conn) error {
 }
 
 func (w *Writer) monitorErrors(conn *websocket.Conn, errChan <-chan error) error {
-	for err := range errChan {
-		if err != nil {
-			log.Printf("Processing error: %v", err)
-			if werr := conn.WriteMessage(websocket.TextMessage, []byte("Processing error")); werr != nil {
-				return fmt.Errorf("error sending status: %v (original error: %w)", werr, err)
-			}
-			return err
-		}
 
-	}
 	return nil
 }

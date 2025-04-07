@@ -191,7 +191,7 @@
             reader.readAsArrayBuffer(blob);
           } else {
             console.log("All chunks sent.");
-            socket.close();
+            // socket.close();
           }
         };
 
@@ -199,6 +199,10 @@
 
         socket.addEventListener("message", (event) => {
           if (event.data === "Chunk received") {
+            sendChunk();
+          }
+
+          if (event.data === "processed") {
             acknowledgedBatches++;
 
             // Update progress bar
@@ -209,11 +213,9 @@
             if (acknowledgedBatches === totalBatches) {
               // All chunks acknowledged, close connection after short delay
               setTimeout(() => {
-                socket.close();
+                // socket.close();
                 progressContainer.classList.add("hidden");
               }, 1000);
-            } else {
-              sendChunk();
             }
           }
         });
