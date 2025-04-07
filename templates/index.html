@@ -152,37 +152,48 @@
       const file = event.target.querySelector('input[type="file"]').files[0];
       if (!file) return;
 
-      const socket = new WebSocket("ws://localhost:9090");
+      const socket = new WebSocket("ws://localhost:9090/process");
 
-      socket.addEventListener("open", async () => {
-        console.log("Socket connected. Streaming file...");
+      socket.addEventListener("open", () => {
+        console.log("WebSocket connection established!");
 
-        const reader = file.stream().getReader();
-        const encoder = new TextEncoder();
+        const chunkSize = 1024 * 1024;
+        let offset = 0;
 
-        let chunkIndex = 0;
+        const sendChunk = () => {
+          if (offset < file.size) {
+            const reader = new FileReader();
+            const blob = file.slice(offset, offset + chunkSize);
 
-        while (true) {
-          const { done, value } = await reader.read();
-          if (done) break;
+            reader.onload = () => {
+              const chunk = reader.result;
+              socket.send(chunk);
+              offset += chunkSize;
+              console.log(`Sent chunk from byte ${offset}`);
+            };
 
-          socket.send(
-            JSON.stringify({
-              type: "chunk",
-              chunkIndex,
-              data: btoa(String.fromCharCode(...value)), // base64 encode
-            })
-          );
+            reader.readAsArrayBuffer(blob);
+          } else {
+            console.log("All chunks sent.");
+            socket.close();
+          }
+        };
 
-          chunkIndex++;
-        }
+        sendChunk();
 
-        socket.send(JSON.stringify({ type: "done" }));
-        console.log("File streaming complete.");
+        socket.addEventListener("message", (event) => {
+          if (event.data === "Chunk received") {
+            sendChunk();
+          }
+        });
       });
 
       socket.addEventListener("error", (err) => {
-        console.error("Socket error:", err);
+        console.error("WebSocket error:", err);
+      });
+
+      socket.addEventListener("close", () => {
+        console.log("WebSocket connection closed.");
       });
     }
 
@@ -192,7 +203,7 @@
       handlePagination();
       document
         .getElementById("upload-form")
-        .addEventListener("submit", handleFormSubmit); // Handle form submission
+        .addEventListener("submit", handleFormSubmit); 
     };
   </script>
 </body>

@@ -9,9 +9,11 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"strings"
 	"sync"
 	"sync/atomic"
 
+	"github.com/gorilla/websocket"
 	"github.com/rs/cors"
 )
 
@@ -21,14 +23,21 @@ const (
 )
 
 type Writer struct {
-	db  *db.DB
-	mux *http.ServeMux
+	db       *db.DB
+	mux      *http.ServeMux
+	upgrader *websocket.Upgrader
 }
 
 func NewWriter(db *db.DB) *Writer {
+	upgrader := websocket.Upgrader{
+		CheckOrigin: func(r *http.Request) bool {
+			return true
+		},
+	}
 	return &Writer{
-		db:  db,
-		mux: new(http.ServeMux),
+		db:       db,
+		mux:      new(http.ServeMux),
+		upgrader: &upgrader,
 	}
 }
 
@@ -37,7 +46,80 @@ func (w *Writer) RegisterHandlers() {
 	w.mux.HandleFunc("/locations", w.GetLocations)
 }
 
+func (w *Writer) StartServer(addr string) error {
+	w.RegisterHandlers()
+
+	corsHandler := cors.New(cors.Options{
+		AllowedOrigins: []string{"*"},
+		AllowedMethods: []string{"GET", "POST", "OPTIONS"},
+		AllowedHeaders: []string{"Content-Type", "Authorization"},
+	}).Handler(w.mux)
+	fmt.Println("Starting server on", addr)
+
+	if err := http.ListenAndServe(addr, corsHandler); err != nil {
+		return fmt.Errorf("error starting server: %v", err)
+	}
+
+	return nil
+}
+
 func (w *Writer) UploadHandler(wr http.ResponseWriter, r *http.Request) {
+
+	conn, err := w.upgrader.Upgrade(wr, r, nil)
+	if err != nil {
+		http.Error(wr, "Failed to upgrade to WebSocket", http.StatusInternalServerError)
+		return
+	}
+	defer conn.Close()
+
+	log.Println("WebSocket connection established.")
+
+	for {
+		_, msg, err := conn.ReadMessage()
+		if err != nil {
+			log.Println("Error reading message:", err)
+			break
+		}
+		ms := map[string]int{
+			"LOCID":       0,
+			"LOCTIMEZONE": 1,
+			"COUNTRY":     2,
+			"LOCNAME":     3,
+			"BUSINESS":    4,
+		}
+		log.Printf("Received chunk: %s", string(msg))
+
+		rows := strings.Split(string(msg), "\n")
+
+		for _, row := range rows {
+			record := strings.Split(row, ",")
+
+			if len(record) < 5 {
+				log.Printf("Skipping invalid row: %s", row)
+				continue
+			}
+
+			location := model.Location{
+				LocID:       record[ms["LOCID"]],
+				LocTimeZone: record[ms["LOCTIMEZONE"]],
+				Country:     record[ms["COUNTRY"]],
+				LocName:     record[ms["LOCNAME"]],
+				Business:    record[ms["BUSINESS"]],
+			}
+
+			log.Printf("Parsed Location: %+v", location)
+
+		}
+
+		if err = conn.WriteMessage(websocket.TextMessage, []byte("Chunk received")); err != nil {
+			log.Println("Error sending acknowledgment:", err)
+			break
+		}
+	}
+
+	log.Println("WebSocket connection closed.")
+}
+func (w *Writer) uploadHandler(wr http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(wr, "Invalid request method", http.StatusMethodNotAllowed)
 		return
@@ -126,21 +208,4 @@ func (w *Writer) UploadHandler(wr http.ResponseWriter, r *http.Request) {
 	wr.WriteHeader(http.StatusOK)
 	wr.Write([]byte("CSV processed successfully"))
 	fmt.Fprintf(wr, "CSV uploaded and processed successfully")
-}
-
-func (w *Writer) StartServer(addr string) error {
-	w.RegisterHandlers()
-
-	corsHandler := cors.New(cors.Options{
-		AllowedOrigins: []string{"*"},
-		AllowedMethods: []string{"GET", "POST", "OPTIONS"},
-		AllowedHeaders: []string{"Content-Type", "Authorization"},
-	}).Handler(w.mux)
-	fmt.Println("Starting server on", addr)
-
-	if err := http.ListenAndServe(addr, corsHandler); err != nil {
-		return fmt.Errorf("error starting server: %v", err)
-	}
-
-	return nil
 }
