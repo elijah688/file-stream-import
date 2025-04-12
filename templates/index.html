@@ -177,56 +177,81 @@
         let acknowledgedBatches = 0;
 
         const sendChunk = () => {
+          if (socket.readyState !== WebSocket.OPEN) {
+            console.error("WebSocket is not open");
+            return;
+          }
+
           if (offset < file.size) {
             const reader = new FileReader();
             const blob = file.slice(offset, offset + chunkSize);
 
             reader.onload = () => {
-              const chunk = reader.result;
-              socket.send(chunk);
-              offset += chunkSize;
-              console.log(`Sent chunk from byte ${offset}`);
+              try {
+                socket.send(reader.result);
+                offset += blob.size;
+                console.log(`Sent chunk from byte ${offset}`);
+              } catch (err) {
+                console.error("Error sending chunk:", err);
+                socket.close();
+                alert("Error sending data: " + err.message);
+              }
+            };
+
+            reader.onerror = (error) => {
+              console.error("Error reading file:", error);
+              socket.close();
+              alert("Error reading file: " + error);
             };
 
             reader.readAsArrayBuffer(blob);
           } else {
             console.log("All chunks sent.");
-            // socket.close();
+            // Send an empty chunk to signal end of file
+            socket.send(new ArrayBuffer(0));
           }
         };
 
         sendChunk();
 
         socket.addEventListener("message", (event) => {
-          if (event.data === "Chunk received") {
-            sendChunk();
-          }
-
           if (event.data === "processed") {
+            // Send next chunk
+            sendChunk();
+            
+            // Update progress
             acknowledgedBatches++;
-
-            // Update progress bar
-            const progress = (acknowledgedBatches / totalBatches) * 100;
+            const progress = Math.min((acknowledgedBatches / totalBatches) * 100, 100);
             progressBar.style.width = `${progress}%`;
             progressBar.textContent = `${Math.round(progress)}%`;
 
-            if (acknowledgedBatches === totalBatches) {
-              // All chunks acknowledged, close connection after short delay
-              setTimeout(() => {
-                // socket.close();
-                progressContainer.classList.add("hidden");
-              }, 1000);
+            if (acknowledgedBatches >= totalBatches) {
+              console.log("All batches processed");
             }
+          } else if (event.data.startsWith("Error:")) {
+            console.error("Server error:", event.data);
+            progressContainer.classList.add("hidden");
+            alert("Upload failed: " + event.data);
+            socket.close();
+          } else if (event.data === "Processing complete") {
+            console.log("Upload completed successfully");
+            progressContainer.classList.add("hidden");
+            fetchLocations(currentPage);
+            socket.close();
+          }
+        });
+
+        socket.addEventListener("close", (event) => {
+          console.log("WebSocket closed with code:", event.code, "reason:", event.reason);
+          if (!event.wasClean) {
+            progressContainer.classList.add("hidden");
+            alert("Connection closed unexpectedly. Please try again.");
           }
         });
       });
 
       socket.addEventListener("error", (err) => {
         console.error("WebSocket error:", err);
-      });
-
-      socket.addEventListener("close", () => {
-        console.log("WebSocket connection closed.");
       });
     }
 
