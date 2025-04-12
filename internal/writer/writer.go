@@ -25,7 +25,6 @@ func (w *Writer) UploadHandler(wr http.ResponseWriter, r *http.Request) {
 		http.Error(wr, "Failed to upgrade to WebSocket", http.StatusInternalServerError)
 		return
 	}
-	defer conn.Close()
 
 	log.Println("WebSocket connection established.")
 
@@ -46,11 +45,14 @@ func (w *Writer) UploadHandler(wr http.ResponseWriter, r *http.Request) {
 		for batchSize := range processed {
 			count.Add(uint32(batchSize))
 			if err := conn.WriteMessage(websocket.TextMessage, []byte("processed")); err != nil {
+
 				errChan <- fmt.Errorf("failed to send progress: %w", err)
 				return
 			}
 			log.Printf("Processed: %d rows", count.Load())
 		}
+		conn.WriteMessage(websocket.TextMessage, []byte("Processing complete"))
+
 	}()
 
 	// Start workers
@@ -68,13 +70,13 @@ func (w *Writer) UploadHandler(wr http.ResponseWriter, r *http.Request) {
 		}()
 	}
 
-	// Producer: read and batch data
+	// Producer: read and buffer all lines first
 	go func() {
 		defer close(rows)
 		var (
 			ms         map[string]int
 			gotHeader  bool
-			buf        []model.Location
+			allLines   []model.Location
 			lineBuffer string
 		)
 
@@ -82,16 +84,13 @@ func (w *Writer) UploadHandler(wr http.ResponseWriter, r *http.Request) {
 			_, msg, err := conn.ReadMessage()
 			if err != nil {
 				if websocket.IsCloseError(err, websocket.CloseGoingAway, websocket.CloseNormalClosure) || err == io.EOF {
-					// Process any remaining partial line before exiting
-					if lineBuffer != "" {
-						if loc, err := w.processLine(lineBuffer, ms); err == nil {
-							buf = append(buf, loc)
-						}
-					}
 					break
 				}
 				errChan <- fmt.Errorf("read error: %w", err)
 				return
+			}
+			if len(msg) == 0 {
+				break
 			}
 
 			// Process the message
@@ -106,6 +105,7 @@ func (w *Writer) UploadHandler(wr http.ResponseWriter, r *http.Request) {
 				lines = lines[:len(lines)-1]
 			}
 
+			// Process complete lines
 			for _, line := range lines {
 				line = strings.TrimSpace(line)
 				if line == "" {
@@ -128,30 +128,41 @@ func (w *Writer) UploadHandler(wr http.ResponseWriter, r *http.Request) {
 					log.Printf("Skipping invalid line: %v", err)
 					continue
 				}
-				buf = append(buf, loc)
-
-				// Send batch when full
-				if len(buf) >= chunkSize {
-					rows <- buf
-					buf = make([]model.Location, 0, chunkSize)
-				}
+				allLines = append(allLines, loc)
 			}
 
+			// Acknowledge chunk received and buffered
+			if err := conn.WriteMessage(websocket.TextMessage, []byte("ack")); err != nil {
+				errChan <- fmt.Errorf("failed to send ack: %w", err)
+				return
+			}
 		}
 
-		// Send remaining data
-		if len(buf) > 0 {
-			rows <- buf
+		// Process any remaining partial line
+		if lineBuffer != "" {
+			if loc, err := w.processLine(lineBuffer, ms); err == nil {
+				allLines = append(allLines, loc)
+			}
+		}
+
+		// Send buffered lines in batches
+		batch := make([]model.Location, 0, chunkSize)
+		for _, loc := range allLines {
+			batch = append(batch, loc)
+			if len(batch) >= chunkSize {
+				rows <- batch
+				batch = make([]model.Location, 0, chunkSize)
+			}
+		}
+		if len(batch) > 0 {
+			rows <- batch
 		}
 	}()
 
 	// Wait for completion or error
 	go func() {
-		// First wait for all workers to finish processing
 		wg.Wait()
-		// Then close processed channel - no more updates will be sent
 		close(processed)
-		// Finally close error channel
 		close(errChan)
 	}()
 
@@ -163,7 +174,6 @@ func (w *Writer) UploadHandler(wr http.ResponseWriter, r *http.Request) {
 	}
 
 	log.Println("All data processed successfully.")
-	conn.WriteMessage(websocket.TextMessage, []byte("Processing complete"))
 }
 
 func (w *Writer) processHeader(line string, ms *map[string]int) error {

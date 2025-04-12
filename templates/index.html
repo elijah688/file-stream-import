@@ -215,11 +215,11 @@
         sendChunk();
 
         socket.addEventListener("message", (event) => {
-          if (event.data === "processed") {
-            // Send next chunk
+          if (event.data === "ack") {
+            // Send next chunk when current one is received and buffered
             sendChunk();
-            
-            // Update progress
+          } else if (event.data === "processed") {
+            // Update progress for processed batches
             acknowledgedBatches++;
             const progress = Math.min((acknowledgedBatches / totalBatches) * 100, 100);
             progressBar.style.width = `${progress}%`;
